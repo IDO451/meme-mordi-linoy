@@ -1,12 +1,12 @@
 // ============================================================
-// MEME GAME MULTIPLAYER SERVER — Cloudflare Worker
+// MEME GAME MULTIPLAYER SERVER — Cloudflare Worker v2
+// Dynamic image upload by host before game starts
 // ============================================================
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // CORS headers for all responses
     const cors = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -17,23 +17,18 @@ export default {
       return new Response(null, { headers: cors });
     }
 
-    // Route: /ws?room=XXXX&name=PLAYER — WebSocket upgrade
     if (url.pathname === '/ws') {
       const roomCode = url.searchParams.get('room');
       if (!roomCode) return new Response('Missing room', { status: 400 });
-
-      // Get or create Durable Object for this room
       const id = env.GAME_ROOM.idFromName(roomCode);
       const room = env.GAME_ROOM.get(id);
       return room.fetch(request);
     }
 
-    // Route: /create — create a new room, return 4-digit code
     if (url.pathname === '/create') {
       const code = Math.floor(1000 + Math.random() * 9000).toString();
       const id = env.GAME_ROOM.idFromName(code);
       const room = env.GAME_ROOM.get(id);
-      // Init the room
       await room.fetch(new Request(`${url.origin}/init`, { method: 'POST' }));
       return new Response(JSON.stringify({ code }), {
         headers: { ...cors, 'Content-Type': 'application/json' }
@@ -45,23 +40,25 @@ export default {
 };
 
 // ============================================================
-// DURABLE OBJECT — One instance per game room
+// DURABLE OBJECT
 // ============================================================
 export class GameRoom {
   constructor(state, env) {
     this.state = state;
-    this.sessions = new Map(); // sessionId -> { ws, name, isHost }
+    this.sessions = new Map();
     this.gameState = {
-      phase: 'lobby',      // lobby | creation | voting | result | leaderboard
-      players: {},         // name -> { score, isHost }
+      phase: 'lobby',
+      players: {},
       round: 0,
       roundOrder: [],
-      currentRound: null,  // { imgKey, name, topic }
-      submissions: [],     // { player, text }
-      votes: {},           // player -> points
+      currentRound: null,
+      submissions: [],
+      votes: {},
       voteIdx: 0,
       timerEnd: null,
     };
+    // Dynamic images uploaded by host: array of { imgData, topic }
+    this.uploadedImages = [];
     this.timerTimeout = null;
   }
 
@@ -72,7 +69,6 @@ export class GameRoom {
       return new Response('ok');
     }
 
-    // WebSocket upgrade
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected WebSocket', { status: 426 });
     }
@@ -86,7 +82,6 @@ export class GameRoom {
     const isFirstPlayer = this.sessions.size === 0;
     this.sessions.set(sessionId, { ws: server, name, isHost: isFirstPlayer });
 
-    // Add player to game state
     this.gameState.players[name] = {
       score: this.gameState.players[name]?.score || 0,
       isHost: isFirstPlayer
@@ -101,16 +96,25 @@ export class GameRoom {
 
     server.addEventListener('close', () => {
       this.sessions.delete(sessionId);
-      // Don't remove player from scores if game started
-      if (this.gameState.phase === 'lobby') {
+      if (this.gameState.phase === 'lobby' || this.gameState.phase === 'uploading') {
         delete this.gameState.players[name];
       }
       this.broadcast({ type: 'player_left', name, players: this.gameState.players });
     });
 
-    // Send current state to new player
-    this.sendTo(server, { type: 'welcome', name, isHost: isFirstPlayer, state: this.gameState });
-    // Broadcast updated player list
+    // Send current state — include upload progress if in uploading phase
+    this.sendTo(server, {
+      type: 'welcome',
+      name,
+      isHost: isFirstPlayer,
+      state: this.gameState,
+      uploadedCount: this.uploadedImages.filter(Boolean).length,
+      // Send previews of already uploaded images (thumbnails only, not full data)
+      uploadPreviews: this.uploadedImages.map((img, i) =>
+        img ? { index: i, topic: img.topic, hasImage: true } : null
+      )
+    });
+
     this.broadcast({ type: 'player_joined', name, players: this.gameState.players });
 
     return new Response(null, { status: 101, webSocket: client });
@@ -122,15 +126,69 @@ export class GameRoom {
 
     switch (msg.type) {
 
+      // ── HOST: enter upload phase ──
+      case 'begin_upload': {
+        if (!session.isHost) return;
+        this.gameState.phase = 'uploading';
+        this.uploadedImages = [];
+        this.broadcast({
+          type: 'upload_phase_started',
+          hostName: session.name
+        });
+        break;
+      }
+
+      // ── HOST: upload one image ──
+      case 'upload_image': {
+        if (!session.isHost) return;
+        if (this.gameState.phase !== 'uploading') return;
+
+        const { index, imgData, topic } = msg;
+        if (index < 0 || index > 4) return;
+        if (!imgData || !imgData.startsWith('data:image')) return;
+
+        this.uploadedImages[index] = {
+          imgData,
+          topic: topic || `תמונה ${index + 1}`
+        };
+
+        const uploaded = this.uploadedImages.filter(Boolean).length;
+
+        // Broadcast to all: image slot filled (no image data — just progress)
+        this.broadcast({
+          type: 'image_uploaded',
+          index,
+          topic: this.uploadedImages[index].topic,
+          uploaded,
+          total: 5
+        });
+        break;
+      }
+
+      // ── HOST: remove an uploaded image ──
+      case 'remove_image': {
+        if (!session.isHost) return;
+        const { index } = msg;
+        if (index >= 0 && index <= 4) {
+          this.uploadedImages[index] = null;
+          const uploaded = this.uploadedImages.filter(Boolean).length;
+          this.broadcast({ type: 'image_removed', index, uploaded, total: 5 });
+        }
+        break;
+      }
+
+      // ── HOST: start game (all images must be uploaded) ──
       case 'start_game': {
         if (!session.isHost) return;
         const playerNames = Object.keys(this.gameState.players);
         if (playerNames.length < 2) return;
 
+        const ready = this.uploadedImages.filter(Boolean);
+        if (ready.length < 5) return; // must have all 5
+
         this.gameState.phase = 'creation';
         this.gameState.round = 0;
-        this.gameState.roundOrder = this.shuffle([0,1,2,3,4]);
-        // Reset scores
+        this.gameState.roundOrder = this.shuffle([0, 1, 2, 3, 4]);
         playerNames.forEach(p => { this.gameState.players[p].score = 0; });
 
         this.startRound();
@@ -143,18 +201,16 @@ export class GameRoom {
         if (!text || !text.trim()) return;
         const name = session.name;
 
-        // Remove previous submission from this player
         this.gameState.submissions = this.gameState.submissions.filter(s => s.player !== name);
         this.gameState.submissions.push({ player: name, text: text.trim() });
 
         this.broadcast({
           type: 'submission_update',
-          submissions: this.gameState.submissions.map(s => ({ player: s.player })), // hide text until voting
+          submissions: this.gameState.submissions.map(s => ({ player: s.player })),
           count: this.gameState.submissions.length,
           total: Object.keys(this.gameState.players).length
         });
 
-        // Auto-advance if everyone submitted
         const playerCount = Object.keys(this.gameState.players).length;
         if (this.gameState.submissions.length >= playerCount) {
           if (this.timerTimeout) clearTimeout(this.timerTimeout);
@@ -169,12 +225,10 @@ export class GameRoom {
         const currentMeme = this.gameState.submissions[this.gameState.voteIdx];
         if (!currentMeme) return;
 
-        // Each player votes once per meme
         const voteKey = `${session.name}:${this.gameState.voteIdx}`;
-        if (this.gameState.votes[voteKey]) return; // already voted
+        if (this.gameState.votes[voteKey]) return;
         this.gameState.votes[voteKey] = true;
 
-        // Accumulate points for the meme author
         const author = currentMeme.player;
         if (!this.gameState.votes[author]) this.gameState.votes[author] = 0;
         this.gameState.votes[author] += points;
@@ -184,16 +238,13 @@ export class GameRoom {
       }
 
       case 'next_meme': {
-        if (!session.isHost && this.gameState.phase === 'voting') return;
+        if (!session.isHost) return;
         this.gameState.voteIdx++;
         if (this.gameState.voteIdx < this.gameState.submissions.length) {
           this.broadcast({
             type: 'show_meme',
             voteIdx: this.gameState.voteIdx,
-            meme: {
-              text: this.gameState.submissions[this.gameState.voteIdx].text,
-              // author hidden until reveal
-            },
+            meme: { text: this.gameState.submissions[this.gameState.voteIdx].text },
             total: this.gameState.submissions.length
           });
         } else {
@@ -226,7 +277,7 @@ export class GameRoom {
           voteIdx: 0,
           timerEnd: null,
         };
-        // Re-add all connected players
+        this.uploadedImages = [];
         for (const [sid, sess] of this.sessions) {
           this.gameState.players[sess.name] = { score: 0, isHost: sess.isHost };
         }
@@ -237,17 +288,20 @@ export class GameRoom {
   }
 
   startRound() {
-    const ROUNDS = [
-      { key:'img1', name:'הסמטה המצוירת', topics:['מורדי מגלה מה בדיוק קיבל כמתנה','לינוי בוחרת מתנה לתקציב של מורדי','החתול חושב מה הוא עושה עם הווסט'] },
-      { key:'img2', name:'מבצעים ברחוב',  topics:['מורדי גילה כמה עולה האולם','מורדי מחשב את עלות הבר האקטיבי','כשמורדי ראה את מחיר הקייטרינג'] },
-      { key:'img3', name:'מתחת לשמיכה',  topics:['מי האישה עם אוזני הארנב בדלת','כשמורדי שכח להזמין מישהו חשוב','בוקר יום החתונה'] },
-      { key:'img4', name:'ים המלח',       topics:['הסכם הממון הסודי','ההבטחות שמורדי הבטיח ללינוי','מה הסכימו שם עם הבוץ'] },
-      { key:'img5', name:'לינוי הפיצית', topics:['מי מחליט בבית','לינוי מסבירה לאן ירח דבש','מי שולט ביחסים'] }
-    ];
+    // Use dynamically uploaded images
+    const roundIdx = this.gameState.roundOrder[this.gameState.round];
+    const imgEntry = this.uploadedImages[roundIdx];
 
-    const rd = ROUNDS[this.gameState.roundOrder[this.gameState.round]];
-    const topic = rd.topics[Math.floor(Math.random() * rd.topics.length)];
-    this.gameState.currentRound = { key: rd.key, name: rd.name, topic };
+    if (!imgEntry) {
+      // Fallback — skip (shouldn't happen if start_game validated)
+      return;
+    }
+
+    this.gameState.currentRound = {
+      imgData: imgEntry.imgData,  // full base64, sent to all clients
+      topic: imgEntry.topic,
+      name: `תמונה ${roundIdx + 1}`
+    };
     this.gameState.phase = 'creation';
     this.gameState.submissions = [];
     this.gameState.votes = {};
@@ -265,7 +319,6 @@ export class GameRoom {
       players: this.gameState.players
     });
 
-    // Auto-advance when timer expires
     if (this.timerTimeout) clearTimeout(this.timerTimeout);
     this.timerTimeout = setTimeout(() => {
       if (this.gameState.phase === 'creation') this.startVoting();
@@ -294,14 +347,12 @@ export class GameRoom {
   showResult() {
     this.gameState.phase = 'result';
 
-    // Calculate scores
     const sorted = this.gameState.submissions.slice().sort((a, b) =>
       (this.gameState.votes[b.player] || 0) - (this.gameState.votes[a.player] || 0)
     );
     const winner = sorted[0];
     const winPts = this.gameState.votes[winner.player] || 0;
 
-    // Update cumulative score
     if (this.gameState.players[winner.player]) {
       this.gameState.players[winner.player].score += winPts;
     }
