@@ -467,8 +467,8 @@ el('lb-upload-btn').onclick=function(){
 /* ══════════════════════════════════════
    UPLOAD SCREEN LOGIC
 ══════════════════════════════════════ */
-function initUploadScreen(){
-  localImages=[null,null,null,null,null];
+function initUploadScreen(preserveImages){
+  if(!preserveImages) localImages=[null,null,null,null,null];
   el('up-host-view').style.display='flex';
   el('up-guest-view').style.display='none';
   renderSlots();
@@ -583,8 +583,44 @@ function updateUploadProgress(){
 }
 
 el('up-start-btn').onclick=function(){
-  if(localImages.filter(Boolean).length<5){toast('העלה 5 תמונות קודם!');return;}
-  send({type:'start_game'});
+  var ready = localImages.filter(Boolean).length;
+  if(ready<5){toast('העלה '+ready+' מתוך 5 תמונות');return;}
+  if(!ws || ws.readyState !== WebSocket.OPEN){
+    toast('מתחבר... נסה שוב בעוד שנייה');
+    if(roomCode && myName) connect(roomCode, myName);
+    return;
+  }
+  var btn = el('up-start-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ שולח תמונות...';
+
+  // Re-send ALL images to ensure server has them (handles reconnect case)
+  var acksReceived = 0;
+  var totalToSend = localImages.filter(Boolean).length;
+  
+  function sendNext(idx){
+    if(idx >= 5){ 
+      // All sent — wait briefly then start game
+      btn.textContent = '⏳ מתחיל...';
+      setTimeout(function(){
+        if(ws && ws.readyState === WebSocket.OPEN){
+          send({type:'start_game'});
+        }
+      }, 300);
+      setTimeout(function(){
+        if(btn.disabled){ btn.disabled=false; btn.textContent='🎲 התחל משחק!'; }
+      }, 5000);
+      return;
+    }
+    if(localImages[idx] && ws && ws.readyState === WebSocket.OPEN){
+      send({type:'upload_image', index:idx, imgData:localImages[idx].dataUrl, topic:localImages[idx].topic||('תמונה '+(idx+1))});
+    }
+    // 200ms between images — avoids WebSocket buffer overflow on large base64
+    setTimeout(function(){ sendNext(idx+1); }, 200);
+  }
+  
+  btn.textContent = '⏳ שולח תמונות (0/5)...';
+  sendNext(0);
 };
 
 /* ── IMAGE COMPRESSION ── */
@@ -800,6 +836,24 @@ function handleMsg(msg){
       el('r-gwait').style.display=myIsHost?'none':'block';
       el('r-load').style.display='flex';el('r-ai').style.display='none';
       show('s-result');callAI(msg);
+      break;
+
+    case 'error':
+      // Server error — re-enable button + show message
+      toast('שגיאה: ' + (msg.msg || msg.code));
+      var startBtn = el('up-start-btn');
+      if(startBtn){ startBtn.disabled = false; startBtn.textContent = '🎲 התחל משחק!'; }
+      console.error('Server error:', msg);
+      break;
+
+    case 'image_ack':
+      // Server confirmed image received — update button progress
+      if(myIsHost){
+        var lbl = el('up-lbl');
+        if(lbl) lbl.textContent = msg.uploaded + ' מתוך ' + msg.total + ' תמונות ✓';
+        var sb = el('up-start-btn');
+        if(sb && sb.disabled) sb.textContent = '⏳ שולח תמונות (' + msg.uploaded + '/5)...';
+      }
       break;
 
     case 'leaderboard': showLB(msg.players); break;
