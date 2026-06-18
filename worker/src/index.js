@@ -155,6 +155,14 @@ export class GameRoom {
         const uploaded = this.uploadedImages.filter(Boolean).length;
 
         // Broadcast to all: image slot filled (no image data — just progress)
+        // Confirm receipt to host
+        this.sendTo(session.ws, {
+          type: 'image_ack',
+          index,
+          uploaded,
+          total: 5
+        });
+        // Broadcast progress to guests (no image data)
         this.broadcast({
           type: 'image_uploaded',
           index,
@@ -181,10 +189,15 @@ export class GameRoom {
       case 'start_game': {
         if (!session.isHost) return;
         const playerNames = Object.keys(this.gameState.players);
-        if (playerNames.length < 2) return;
-
+        if (playerNames.length < 2) {
+          this.sendTo(session.ws, { type: 'error', code: 'need_players', msg: 'צריך לפחות 2 שחקנים' });
+          return;
+        }
         const ready = this.uploadedImages.filter(Boolean);
-        if (ready.length < 5) return; // must have all 5
+        if (ready.length < 5) {
+          this.sendTo(session.ws, { type: 'error', code: 'need_images', msg: 'חסרות תמונות. הועלו ' + ready.length + ' מתוך 5', uploaded: ready.length });
+          return;
+        }
 
         this.gameState.phase = 'creation';
         this.gameState.round = 0;
